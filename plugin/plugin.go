@@ -2435,8 +2435,10 @@ func (b *ORMBuilder) generatePatchHandler(message *protogen.Message, g *protogen
 		isMultiAccount = true
 	}
 
-	if isMultiAccount && !b.hasIDField(message) {
-		g.P(fmt.Sprintf("// Cannot autogen DefaultPatch%s: this is a multi-account table without an \"id\" field in the message.\n", typeName))
+	pkName, _ := b.findPrimaryKey(ormable)
+	hasPrimaryKey := pkName != ""
+	if isMultiAccount && !hasPrimaryKey {
+		g.P(fmt.Sprintf("// Cannot autogen DefaultPatch%s: this is a multi-account table without a primary key field in the message.\n", typeName))
 		return
 	}
 
@@ -2451,17 +2453,36 @@ func (b *ORMBuilder) generatePatchHandler(message *protogen.Message, g *protogen
 	g.P(`var err error`)
 	b.generateBeforePatchHookCall(ormable, "Read", g)
 
-	// TODO: not in original code, but it doesn't make a lot of sense to generate code with id if message doesn't have it
-	if b.hasIDField(message) {
-		getIDFormatter := "{Id: in.GetId()},"
-		if b.IsIDFieldOptional(message) {
-			// This is necessary because the GetID returns a non pointer object
-			getIDFormatter = "{Id: in.Id},"
+	if hasPrimaryKey {
+		// Find the corresponding field in the message
+		var pkFieldInMessage *protogen.Field
+		for _, field := range message.Fields {
+			if field.GoName == pkName {
+				pkFieldInMessage = field
+				break
+			}
 		}
-		if b.readHasFieldSelection(ormable) {
-			g.P(`pbReadRes, err := DefaultRead`, typeName, `(ctx, &`, typeName, getIDFormatter, ` db, nil)`)
+
+		var accessor string
+		if pkFieldInMessage != nil {
+			if pkFieldInMessage.Desc.HasOptionalKeyword() {
+				accessor = fmt.Sprintf("in.%s", pkName)
+			} else {
+				accessor = fmt.Sprintf("in.Get%s()", pkName)
+			}
 		} else {
-			g.P(`pbReadRes, err := DefaultRead`, typeName, `(ctx, &`, typeName, getIDFormatter, ` db)`)
+			// Fallback for id field
+			accessor = "in.GetId()"
+			pkName = "Id"
+		}
+
+		// Format the read expression
+		readExpr := fmt.Sprintf("{%s: %s},", pkName, accessor)
+
+		if b.readHasFieldSelection(ormable) {
+			g.P(`pbReadRes, err := DefaultRead`, typeName, `(ctx, &`, typeName, readExpr, ` db, nil)`)
+		} else {
+			g.P(`pbReadRes, err := DefaultRead`, typeName, `(ctx, &`, typeName, readExpr, ` db)`)
 		}
 
 		g.P(`if err != nil {`)
@@ -2489,26 +2510,36 @@ func (b *ORMBuilder) generatePatchHandler(message *protogen.Message, g *protogen
 	b.generateBeforePatchHookDef(ormable, "ApplyFieldMask", g)
 	b.generateBeforePatchHookDef(ormable, "Save", g)
 	b.generateAfterPatchHookDef(ormable, "Save", g)
-
 }
 
 func (b *ORMBuilder) hasIDField(message *protogen.Message) bool {
 	for _, field := range message.Fields {
-		if strings.ToLower(field.GoName) == "id" { // TODO: not sure
+		options := field.Desc.Options().(*descriptorpb.FieldOptions)
+		fieldOpts := getFieldOptions(options)
+		if fieldOpts != nil && fieldOpts.GetTag() != nil && fieldOpts.GetTag().GetPrimaryKey() {
 			return true
 		}
 	}
-
+	for _, field := range message.Fields {
+		if strings.ToLower(field.GoName) == "id" {
+			return true
+		}
+	}
 	return false
 }
 
 // IsIDFieldOptional if the ID is an optional field
 func (b *ORMBuilder) IsIDFieldOptional(message *protogen.Message) bool {
 	for _, field := range message.Fields {
+		options := field.Desc.Options().(*descriptorpb.FieldOptions)
+		fieldOpts := getFieldOptions(options)
+		if fieldOpts != nil && fieldOpts.GetTag() != nil && fieldOpts.GetTag().GetPrimaryKey() {
+			return field.Desc.HasOptionalKeyword()
+		}
+	}
+	for _, field := range message.Fields {
 		if strings.ToLower(field.GoName) == "id" {
-			if field.Desc.HasOptionalKeyword() {
-				return true
-			}
+			return field.Desc.HasOptionalKeyword()
 		}
 	}
 	return false
@@ -3500,14 +3531,42 @@ func (b *ORMBuilder) generateReadServerMethod(service autogenService, method aut
 		b.generateDBSetup(service, g)
 		b.generatePreserviceCall(service, method.baseType, method.ccName, g)
 		typeName := method.baseType
-		getIDFormatter := "{Id: in.GetId()},"
-		if b.IsIDFieldOptional(method.inType) {
-			getIDFormatter = "{Id: in.Id},"
+		ormable := b.getOrmable(typeName)
+		pkFieldName, _ := b.findPrimaryKey(ormable)
+		pkGoFieldName := camelCase(pkFieldName)
+		var requestFieldName string
+		var requestField *protogen.Field
+		for _, field := range method.inType.Fields {
+			if field.GoName == pkGoFieldName {
+				requestFieldName = field.GoName
+				requestField = field
+				break
+			}
 		}
-		if fields := b.getFieldSelection(method.inType); fields != "" {
-			g.P(`res, err := DefaultRead`, typeName, `(ctx, &`, typeName, getIDFormatter, `db, in.`, fields, `)`)
+		if requestFieldName == "" {
+			for _, field := range method.inType.Fields {
+				if strings.ToLower(field.GoName) == "id" {
+					requestFieldName = field.GoName
+					requestField = field
+					break
+				}
+			}
+		}
+		var accessor string
+		if requestField != nil {
+			if requestField.Desc.HasOptionalKeyword() {
+				accessor = fmt.Sprintf("in.%s", requestFieldName)
+			} else {
+				accessor = fmt.Sprintf("in.Get%s()", requestFieldName)
+			}
 		} else {
-			g.P(`res, err := DefaultRead`, typeName, `(ctx, &`, typeName, getIDFormatter, ` db)`)
+			accessor = "in.GetId()"
+		}
+		paramExpr := fmt.Sprintf("{%s: %s},", pkGoFieldName, accessor)
+		if fields := b.getFieldSelection(method.inType); fields != "" {
+			g.P(`res, err := DefaultRead`, typeName, `(ctx, &`, typeName, paramExpr, `db, in.`, fields, `)`)
+		} else {
+			g.P(`res, err := DefaultRead`, typeName, `(ctx, &`, typeName, paramExpr, ` db)`)
 		}
 		g.P(`if err != nil {`)
 		g.P(`return nil, `, b.wrapSpanError(service, "err"))
@@ -3639,11 +3698,39 @@ func (b *ORMBuilder) generateDeleteServerMethod(service autogenService, method a
 		typeName := method.baseType
 		b.generateDBSetup(service, g)
 		b.generatePreserviceCall(service, method.baseType, method.ccName, g)
-		getIDFormatter := "{Id: in.GetId()},"
-		if b.IsIDFieldOptional(method.inType) {
-			getIDFormatter = "{Id: in.Id},"
+		ormable := b.getOrmable(typeName)
+		pkFieldName, _ := b.findPrimaryKey(ormable)
+		pkGoFieldName := camelCase(pkFieldName)
+		var requestFieldName string
+		var requestField *protogen.Field
+		for _, field := range method.inType.Fields {
+			if field.GoName == pkGoFieldName {
+				requestFieldName = field.GoName
+				requestField = field
+				break
+			}
 		}
-		g.P(`err := DefaultDelete`, typeName, `(ctx, &`, typeName, getIDFormatter, ` db)`)
+		if requestFieldName == "" {
+			for _, field := range method.inType.Fields {
+				if strings.ToLower(field.GoName) == "id" {
+					requestFieldName = field.GoName
+					requestField = field
+					break
+				}
+			}
+		}
+		var accessor string
+		if requestField != nil {
+			if requestField.Desc.HasOptionalKeyword() {
+				accessor = fmt.Sprintf("in.%s", requestFieldName)
+			} else {
+				accessor = fmt.Sprintf("in.Get%s()", requestFieldName)
+			}
+		} else {
+			accessor = "in.GetId()"
+		}
+		paramExpr := fmt.Sprintf("{%s: %s},", pkGoFieldName, accessor)
+		g.P(`err := DefaultDelete`, typeName, `(ctx, &`, typeName, paramExpr, ` db)`)
 		g.P(`if err != nil {`)
 		g.P(`return nil, `, b.wrapSpanError(service, "err"))
 		g.P(`}`)
